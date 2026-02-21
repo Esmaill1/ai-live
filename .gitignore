@@ -1,0 +1,19 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Audio artifacts (generated at runtime)
+*.wav
+*.mp3
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
