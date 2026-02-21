@@ -1,169 +1,218 @@
-# Project Context — Real-Time Voice Assistant
+# Project Context — AI Live Voice Assistant
 
 ## What Is This?
 
-A **real-time, conversational AI voice assistant** written in a single Python
-file (`asd.py`). The assistant listens to your microphone, detects when you
-speak, transcribes your words, generates an intelligent response via an LLM,
-and reads it back to you using text-to-speech — all in a continuous loop.
+A **real-time, conversational AI voice assistant** with a futuristic web UI.
+The entire interaction happens in the browser — microphone capture, speech
+detection, and audio playback. The server handles the AI pipeline: speech-to-text,
+language model, and text-to-speech.
+
+Two versions are included:
+
+| File | Type | Description |
+|------|------|-------------|
+| `server.py` | **Web App** (primary) | Flask + Socket.IO webapp. Browser-based audio. Deployable anywhere |
+| `asd.py` | CLI tool (legacy) | Uses system mic/speakers via sounddevice + Silero VAD. Local only |
 
 ## High-Level Architecture
 
 ```
-┌─────────────┐     ┌──────────────┐     ┌─────────────┐     ┌───────────┐     ┌──────────┐
-│  Microphone │────►│  Silero VAD  │────►│  Groq       │────►│  Groq     │────►│ Edge TTS │
-│  (16 kHz)   │     │  (speech     │     │  Whisper    │     │  LLaMA 3  │     │ (Jenny)  │
-│             │     │   detection) │     │  (STT)      │     │  (chat)   │     │          │
-└─────────────┘     └──────────────┘     └─────────────┘     └───────────┘     └──────────┘
-                                                                                     │
-                                                                                     ▼
-                                                                               ┌──────────┐
-                                                                               │ Speaker  │
-                                                                               │ Playback │
-                                                                               └──────────┘
+┌─────────── Browser (any device) ───────────┐      ┌────────── Server (Flask) ──────────┐
+│                                             │      │                                     │
+│  🎤 getUserMedia → MediaRecorder            │      │  No sounddevice / No PyTorch        │
+│  📊 Web Audio API AnalyserNode (VAD)        │      │  No system audio needed             │
+│  🔊 HTML5 Audio (playback)                  │      │                                     │
+│                                             │      │                                     │
+│  audio blob ────── audio_data ─────────►    │      │  1. Groq Whisper (STT)              │
+│                                             │      │  2. Groq LLaMA / GPT-OSS (LLM)     │
+│  ◄──── audio_response ──── base64 MP3       │      │  3. Edge TTS (synthesis)            │
+│                                             │      │                                     │
+│  ◄──── state / rate_limit / lang_detected   │      │  Per-session: chat history, voice,  │
+│  ──── interrupt / set_voice / set_prompt ──► │      │    system prompt, cancel flag       │
+└─────────────────────────────────────────────┘      └─────────────────────────────────────┘
 ```
 
-## Core Pipeline (per utterance)
+## Pipeline — What Happens Per Utterance
 
-| Stage | Component | Description |
-|-------|-----------|-------------|
-| **1. Capture** | `sounddevice.InputStream` | Captures 512-sample audio chunks at 16 kHz, mono |
-| **2. VAD** | Silero VAD (PyTorch) | Each chunk is scored for speech probability (0–1). A state machine tracks speech start/end |
-| **3. STT** | Groq Whisper Large v3 | When speech ends, raw audio is converted to int16 WAV bytes and sent to Groq's Whisper API |
-| **4. LLM** | Groq LLaMA 3.1 8B | The transcribed text + chat history is streamed to the LLM. Tokens print to console in real time |
-| **5. TTS** | Microsoft Edge TTS | The **complete** LLM response is synthesized in a single call → one continuous MP3 audio clip |
-| **6. Playback** | `sounddevice.OutputStream` | MP3 is decoded to PCM via pydub and played in 1024-sample chunks |
+| Stage | Where | Component | Description |
+|-------|-------|-----------|-------------|
+| **1. Capture** | Browser | `getUserMedia` + `MediaRecorder` | Records audio as WebM/Opus blob |
+| **2. VAD** | Browser | Web Audio API `AnalyserNode` | RMS volume with 3-frame consecutive speech detection |
+| **3. Transport** | Network | Socket.IO `audio_data` event | Audio blob sent as binary via WebSocket |
+| **4. STT** | Server | Groq Whisper Large v3 Turbo | Transcribes audio + detects language |
+| **5. Filter** | Server | Noise phrase filter | Rejects Whisper hallucinations ("Thank you", "Bye", etc.) |
+| **6. LLM** | Server | Groq GPT-OSS 120B | Generates conversational response |
+| **7. TTS** | Server | Microsoft Edge TTS | Synthesizes response with auto-detected or user-selected voice |
+| **8. Transport** | Network | Socket.IO `audio_response` event | Base64-encoded MP3 sent to browser |
+| **9. Playback** | Browser | HTML5 `Audio` element | Plays the MP3 response |
 
-## Key Design Decisions
+## Key Features
 
-### Single TTS Call (No Sentence Splitting)
-The response is spoken as **one continuous audio clip** rather than split into
-sentences. This avoids audible gaps/pauses between fragments. Text still
-streams to the console in real-time for instant visual feedback.
+### Settings Panel (⚙)
+Slide-out panel with:
+- **Voice selector** — 25 Edge TTS voices across 13 languages, grouped by locale
+- **System prompt editor** — Customize the AI's personality without editing code
+- **Conversation export** — Download chat as timestamped `.txt` file
+- **Clear conversation** — Reset chat history
 
-### LLM Streaming in a Background Thread
-The synchronous Groq streaming iterator (`for chunk in stream:`) runs in a
-**background thread** via `asyncio.to_thread()`. This prevents it from
-blocking the async event loop, keeping VAD and interruption handling responsive.
+### Input Modes
+| Mode | Activation | Behavior |
+|------|-----------|----------|
+| **Auto-detect** (default) | Toggle pill or settings | VAD continuously monitors volume; records when speech detected |
+| **Push-to-talk** | Toggle pill or settings | Hold `Space` key or click orb to record; release to stop |
 
-### Thread-Safe Interruption
-`self.interrupted` is a `threading.Event`, not a plain boolean. This is
-critical because interruption is **set** from the async VAD loop and **checked**
-from background threads (LLM streaming, audio playback). `threading.Event` is
-safe for cross-thread signaling.
+### Noise Filtering (3 layers)
 
-### Bounded Chat History
-Chat history is trimmed to the most recent 20 messages (plus the system prompt)
-before each API call. This prevents exceeding the LLM context window during
-long sessions.
+| Layer | Where | What |
+|-------|-------|------|
+| **Volume threshold** | Browser | `VAD_THRESHOLD = 0.025` — ignores quiet ambient noise |
+| **Consecutive frames** | Browser | Requires 3 above-threshold frames before recording starts |
+| **Min duration** | Browser | `MIN_RECORD_MS = 600` — discards bursts under 600ms |
+| **Noise phrases** | Server | Filters Whisper hallucinations: "Thank you", "Bye", "♪", "..." etc. |
 
-### Task Reference Tracking
-`asyncio.create_task()` results are stored in `self._tasks` with an
-`add_done_callback` for cleanup. This prevents Python from silently swallowing
-exceptions in fire-and-forget tasks.
+### Conversation Persistence
+- Chat history saved to `localStorage` on every message
+- Restored to UI and server on page refresh / reconnect
+- Voice preference, system prompt, and input mode also persist
 
-## VAD State Machine
+### Multi-Language Auto-Detect
+- Whisper detects the spoken language from audio
+- TTS voice automatically switches to match (16 language mappings)
+- Language badge briefly appears in the UI (e.g., "🌐 Arabic")
+- User can override with manual voice selection
 
-```
-                 speech_prob >= 0.5
-    ┌───────────────────────────────────┐
-    │                                   ▼
- [IDLE]                           [TRIGGERED]
-    ▲                                   │
-    │       silence > 0.8s              │
-    └───────────────────────────────────┘
-          (process captured audio)
-```
+### Rate Limit Handling
+- Server catches `groq.RateLimitError` for both STT and LLM
+- Emits `rate_limit` event with countdown seconds
+- Browser shows orange toast with live countdown timer
 
-- **IDLE → TRIGGERED**: First chunk with speech probability ≥ `VAD_THRESHOLD` (0.5)
-- **TRIGGERED (speech)**: Audio chunks are appended to `current_speech_buffer`
-- **TRIGGERED (silence)**: Silence timer starts. Chunks still buffered (captures trailing audio)
-- **TRIGGERED → IDLE**: Silence exceeds `SILENCE_DURATION` (0.8s). If total audio ≥ `MIN_SPEECH_DURATION` (0.2s), processing begins
+### Interruption System
+Three ways to interrupt:
 
-## Interruption Flow
+| Method | Action |
+|--------|--------|
+| **🎤 Speak** | VAD detects voice > threshold×2 → stops playback + records new speech |
+| **🖱️ Click orb** | Stops playback, cancels server work, resets to idle |
+| **⌨️ Escape** | Stops playback, cancels server work, resets to idle |
 
-When the user speaks **while the AI is talking**:
-1. VAD detects speech → `self.interrupted.set()`
-2. `self.is_speaking = False` (immediately)
-3. LLM streaming loop checks `interrupted` → stops generating
-4. TTS synthesis checks `interrupted` → aborts
-5. Audio playback loop checks `interrupted` → stops playing
-6. The user's new speech is captured and processed normally
+Server checks `cancel_flag` at 5 pipeline stages: after STT, before LLM, after LLM, before TTS, during TTS.
+
+## Socket.IO Event Protocol
+
+### Client → Server
+
+| Event | Payload | Description |
+|-------|---------|-------------|
+| `audio_data` | `{ audio: Uint8Array }` | Recorded audio blob |
+| `interrupt` | — | Cancel current AI response |
+| `get_voices` | — | Request voice list |
+| `set_voice` | `{ voice: string }` | Set TTS voice for session |
+| `set_system_prompt` | `{ prompt: string }` | Set custom system prompt, resets history |
+| `restore_history` | `{ messages: [{role, content}] }` | Restore chat from localStorage |
+
+### Server → Client
+
+| Event | Payload | Description |
+|-------|---------|-------------|
+| `state` | `{ state: string }` | `idle` / `listening` / `processing` / `speaking` |
+| `user_message` | `{ text: string }` | Transcribed user speech |
+| `ai_message` | `{ text: string }` | LLM response text |
+| `audio_response` | `{ audio: string }` | Base64-encoded MP3 audio |
+| `error` | `{ message: string }` | Error description |
+| `voices_list` | `{ voices: [{name, locale, gender}] }` | Available TTS voices |
+| `voice_set` | `{ voice: string }` | Confirmation of voice change |
+| `prompt_set` | `{ prompt: string }` | Confirmation of prompt change |
+| `history_restored` | `{ count: number }` | Number of messages restored |
+| `rate_limit` | `{ message, retry_after }` | Rate limit with retry seconds |
+| `language_detected` | `{ code, language }` | Detected spoken language |
 
 ## File Structure
 
 ```
 project/
-├── asd.py                    # Main application (single-file assistant)
-├── .env                      # Environment variables (GROQ_API_KEY)
-├── context.md                # This file — project overview
-├── developer_guide.md        # Developer guide — setup, contribute, extend
-├── ai_response.mp3           # (artifact) Sample TTS output
-├── my_recording.wav          # (artifact) Sample recorded audio
-└── interrupt_recording.wav   # (artifact) Sample interrupted recording
+├── server.py                     # Web app server (Flask + Socket.IO)
+├── asd.py                        # CLI version (legacy, local-only)
+├── templates/
+│   └── index.html                # Futuristic web UI (single-file SPA)
+├── .env                          # Environment variables (GROQ_API_KEY)
+├── .gitignore                    # Excludes .env, audio artifacts, __pycache__
+├── context.md                    # This file — project overview
+└── developer_guide.md            # Setup, API reference, extension guide
 ```
 
 ## Configuration Constants
 
+### Server (`server.py`)
+
 | Constant | Value | Purpose |
 |----------|-------|---------|
-| `SAMPLE_RATE` | 16000 | Audio sample rate (Hz). Standard for Whisper and Silero VAD |
-| `CHANNELS` | 1 | Mono audio |
-| `BLOCK_SIZE` | 512 | Samples per audio chunk sent to VAD |
-| `VAD_THRESHOLD` | 0.5 | Minimum speech confidence to trigger detection |
-| `SILENCE_DURATION` | 0.8 | Seconds of silence before speech is considered ended |
-| `MIN_SPEECH_DURATION` | 0.2 | Minimum speech length (seconds) to process (filters noise) |
-| `MAX_HISTORY` | 20 | Maximum chat messages retained (excluding system prompt) |
-| `TTS_VOICE` | `en-US-JennyNeural` | Microsoft Edge TTS voice identifier |
+| `MAX_HISTORY` | 20 | Max chat messages retained per session |
+| `TTS_VOICE` | `en-US-JennyNeural` | Default Edge TTS voice |
+| `LLM_MODEL` | `openai/gpt-oss-120b` | Groq LLM model |
+| `STT_MODEL` | `whisper-large-v3-turbo` | Groq STT model |
+| `VOICE_LIST` | 25 entries | Curated voices across 13 languages |
+| `LANG_TO_VOICE` | 16 mappings | Language code → TTS voice |
+| `NOISE_PHRASES` | ~30 entries | Whisper hallucination phrases to filter |
+
+### Browser (`index.html`)
+
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `VAD_THRESHOLD` | 0.025 | RMS volume to detect speech |
+| `SILENCE_MS` | 900 | ms of silence before recording stops |
+| `MIN_RECORD_MS` | 600 | Minimum recording length to process |
+| `SPEECH_FRAMES_NEEDED` | 3 | Consecutive above-threshold frames to start |
 
 ## Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `GROQ_API_KEY` | ✅ Yes | API key from [console.groq.com](https://console.groq.com) |
+| `SECRET_KEY` | No | Flask session secret (defaults to `ai-live-secret`) |
 
 ## External API Dependencies
 
-| Service | Endpoint | Purpose | Auth |
-|---------|----------|---------|------|
-| **Groq** | `api.groq.com/openai/v1/audio/transcriptions` | Speech-to-text (Whisper) | API key |
-| **Groq** | `api.groq.com/openai/v1/chat/completions` | LLM chat (LLaMA 3.1) | API key |
-| **Edge TTS** | Microsoft Edge speech service | Text-to-speech | None (free) |
+| Service | Purpose | Auth |
+|---------|---------|------|
+| **Groq Whisper** | Speech-to-text + language detection | API key |
+| **Groq GPT-OSS 120B** | LLM chat | API key |
+| **Edge TTS** | Text-to-speech (25 voices, 13 languages) | None (free) |
 
-## Python Dependencies
+## Server-Side Python Dependencies
 
 | Package | Purpose |
 |---------|---------|
-| `asyncio` | Async event loop for concurrent I/O |
-| `torch` | PyTorch — runs the Silero VAD model |
-| `sounddevice` | Low-level audio I/O (capture + playback) |
-| `numpy` | Audio data manipulation (arrays, concatenation) |
-| `groq` | Official Groq Python client |
-| `edge-tts` | Microsoft Edge TTS (async, free, no API key) |
-| `pydub` | MP3 → PCM audio decoding |
-| `scipy` | WAV file writing (for Whisper API) |
+| `flask` | Web framework |
+| `flask-socketio` | Real-time WebSocket communication |
+| `groq` | Groq API client (STT + LLM) |
+| `edge-tts` | Microsoft Edge TTS (async, free) |
 | `python-dotenv` | Load `.env` file |
 
-> **System dependency**: `pydub` requires **ffmpeg** installed on the system for MP3 decoding.
+## UI Design
 
-## Threading Model
+The web UI features:
+- **Dark futuristic theme** with cyan/purple neon accents
+- **Central glowing orb** that animates per state
+- **Particle system** with connection lines
+- **Glassmorphism settings panel** (slide-out from right)
+- **Audio level meter** below the orb (always visible)
+- **Mode toggle pill** (top-left) for auto-detect / push-to-talk
+- **Language detection badge** (appears briefly for non-English)
+- **Toast notifications** for settings changes and rate limits
+- **Chat panel** with conversation history
 
-```
-Main Thread (asyncio event loop)
-├── process_audio_input()     — async, runs VAD state machine
-├── handle_conversation()     — async task, orchestrates pipeline
-├── stream_response()         — async, coordinates LLM + TTS + playback
-│   ├── asyncio.to_thread(_sync_llm_stream)   — background thread for Groq streaming
-│   ├── edge_tts.Communicate.stream()         — async TTS synthesis
-│   └── asyncio.to_thread(play_audio_segment) — background thread for audio playback
-```
+### Keyboard Shortcuts
 
-## Concurrency Safety
+| Key | Action |
+|-----|--------|
+| `Space` (hold) | Record in push-to-talk mode |
+| `Escape` | Interrupt AI response |
 
-| Shared State | Type | Access Pattern |
-|-------------|------|---------------|
-| `self.interrupted` | `threading.Event` | Set from async loop, checked from threads — **thread-safe** |
-| `self.is_speaking` | `bool` | Set/read from async loop only — **safe** (single-threaded within loop) |
-| `self.audio_queue` | `queue.Queue` | Put from sounddevice callback thread, get from async loop — **thread-safe** |
-| `self.chat_history` | `list` | Modified only in async context (single-threaded) — **safe** |
-| `self.running` | `bool` | Set once on shutdown — **safe** (no race) |
+### localStorage Keys
+
+| Key | Stores |
+|-----|--------|
+| `ai-live-history` | Chat messages array |
+| `ai-live-voice` | Selected TTS voice name |
+| `ai-live-prompt` | Custom system prompt |
+| `ai-live-mode` | Input mode (`auto` / `ptt`) |
